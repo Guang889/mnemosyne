@@ -1,0 +1,290 @@
+# Mnemosyne CJK FTS 支持 · 中文全文搜索修改计划
+
+**完整实施文档 · v1.2 · 2026年5月**
+
+---
+
+## 版本变更说明
+
+| 版本 | 变更说明 |
+|------|---------|
+| v1.0 | 初始版本，基于概念分析，改动3列4个trigger |
+| v1.1 | 基于实际代码 review：trigger数量修正为5个；改动4插入位置精确；_fts_search BEAM_MODE / stop-word / OR 逻辑已适配；部署方式确认为 Plugin 模式 |
+| v1.2 | 需求对齐：新增 embeddings.py 为第二个改动文件（DASHSCOPE_API_KEY、MNEMOSYNE_EMBEDDING_BASE_URL、text-embedding-v4 维度1024）；修正 em_ad trigger 需要 cjk_bigram(old.content)（v1.1 漏改）；_cjk_bigram bigram 条件补全扩展A区；import re 移至模块顶层；记录单字 CJK 查询的 BEAM 过滤边界 |
+
+---
+
+## 0. 背景与目标
+
+Mnemosyne 是为 Hermes Agent 设计的本地优先记忆系统，混合召回权重为：**50% 向量搜索 + 30% FTS5 全文搜索 + 20% 重要性评分**。对于英文内容，三个组件均正常工作；但对于中文（以及日文、韩文等 CJK 语言），FTS5 组件完全失效，有效权重退化为 **71% 向量 + 29% 重要性**。
+
+本文档记录从问题确认到上线验证的完整实施计划。
+
+### 向量 Embedding 配置
+
+| 配置项 | 值 |
+|--------|-----|
+| 模型 | `text-embedding-v4`（阿里云 DashScope） |
+| 向量维度 | 1024（DashScope 默认值，支持 64-2048） |
+| 接入方式 | OpenAI 兼容模式 |
+| Endpoint | `https://dashscope.aliyuncs.com/compatible-mode/v1` |
+| Key 环境变量 | `DASHSCOPE_API_KEY` |
+
+### 部署所需环境变量
+
+```bash
+MNEMOSYNE_EMBEDDING_MODEL=text-embedding-v4
+MNEMOSYNE_EMBEDDING_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
+DASHSCOPE_API_KEY=<your-key>
+```
+
+`OPENROUTER_BASE_URL` / `OPENROUTER_API_KEY` 保持原样，供 LLM / extraction 调用，不受影响。
+
+---
+
+## 1. 修改前评估
+
+### 1.1 问题确认
+
+通过直接 SQLite 查询验证，FTS5 对中文关键词返回 0 条结果，即使内容明确存在于 episodic_memory 表中：
+
+```sql
+SELECT * FROM fts_episodes WHERE fts_episodes MATCH '腾讯云';
+-- 返回: 0 rows
+```
+
+### 1.2 根本原因
+
+`beam.py` 建表 SQL 未指定 tokenizer，默认使用 SQLite 的 `unicode61` 分词器，该分词器仅按空格和标点断词。中文句子没有空格，整句被当作单一 token 索引，任何子词查询均无法命中。
+
+### 1.3 方案选择
+
+| 方案 | 优点 | 缺点 |
+|------|------|------|
+| trigram tokenizer | SQLite 内置，改动极小 | 2字中文词失败（硬伤） |
+| **Bigram 预处理索引 ✅** | 全覆盖，无外部依赖 | 需要改写入和查询两侧 |
+| 结巴分词 (jieba) | 分词质量最高 | 新增依赖，容器安装复杂 |
+
+结论：选择 Bigram 预处理索引。无外部依赖、覆盖所有 CJK 字符长度（含2字词）、与现有 FTS5 基础设施完全兼容。
+
+### 1.4 改动风险评估
+
+| 改动点 | 风险级别 | 缓解措施 |
+|--------|---------|---------|
+| `_cjk_bigram()` 函数 | 低 | 单独单测 |
+| `_get_connection()` 注册 UDF | 中 | 已验证 _thread_local 覆盖逻辑 |
+| FTS trigger 调用 UDF | 中 | P1 单测验证 |
+| `_fts_search()` 查询转换 | 低 | 回滚简单 |
+| embeddings.py key/url 改动 | 低 | 不影响现有 OPENROUTER 路径 |
+| 首次部署，数据库为空 | 无 | 无需 FTS 索引迁移 |
+
+---
+
+## 2. 具体修改点（v1.2）
+
+改动文件：**2个**（`mnemosyne/core/embeddings.py` + `mnemosyne/core/beam.py`）
+
+---
+
+### 改动 0：embeddings.py（3处，约6行）
+
+**0a. `_OPENAI_API_KEY` 读取链补充 `DASHSCOPE_API_KEY`（第39行）**
+
+```python
+# 原
+_OPENAI_API_KEY = os.environ.get("OPENROUTER_API_KEY", os.environ.get("OPENAI_API_KEY", ""))
+
+# 改
+_OPENAI_API_KEY = os.environ.get("DASHSCOPE_API_KEY",
+                  os.environ.get("OPENROUTER_API_KEY",
+                  os.environ.get("OPENAI_API_KEY", "")))
+```
+
+**0b. `_OPENAI_BASE_URL` 新增 embedding 专用配置项（第40行）**
+
+```python
+# 原
+_OPENAI_BASE_URL = os.environ.get("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
+
+# 改
+_OPENAI_BASE_URL = os.environ.get("MNEMOSYNE_EMBEDDING_BASE_URL",
+                   os.environ.get("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1"))
+```
+
+> `extraction/client.py` 独立读取 `OPENROUTER_BASE_URL`，两者互不干扰。
+
+**0c. `_get_embedding_dim` 维度表补充 `text-embedding-v4`（dims 字典内）**
+
+```python
+"text-embedding-v4": 1024,
+```
+
+---
+
+### 改动 1：beam.py — `import re` 移至模块顶层
+
+在 beam.py 已有 import 块末尾（约第 40-50 行）新增：
+
+```python
+import re as _re
+```
+
+删除 `_fts_search`（实际第1439行）和 `_fts_search_working`（实际第1476行）内部各自的 `import re as _re`。
+
+---
+
+### 改动 2：beam.py — 新增 `_cjk_bigram()` 函数
+
+**位置**：`_fts_search()` 定义之前（实际第1435行之前）
+
+```python
+def _cjk_bigram(text: str) -> str:
+    """CJK-aware bigram tokenizer for FTS5. CJK chars -> unigram + bigram; Latin/digits kept as words."""
+    result, buf = [], ''
+    for i, c in enumerate(text):
+        if '一' <= c <= '鿿' or '㐀' <= c <= '䶿':
+            if buf:
+                result.extend(_re.findall(r'[a-zA-Z0-9_]+', buf))
+                buf = ''
+            result.append(c)
+            next_c = text[i + 1] if i + 1 < len(text) else ''
+            if '一' <= next_c <= '鿿' or '㐀' <= next_c <= '䶿':
+                result.append(c + next_c)
+        else:
+            buf += c
+    if buf:
+        result.extend(_re.findall(r'[a-zA-Z0-9_]+', buf))
+    return ' '.join(result) if result else text
+```
+
+> v1.2 修正：bigram 条件覆盖扩展A区（U+3400-U+4DBF），与入口条件一致（v1.1 漏了此处）。
+
+---
+
+### 改动 3：beam.py — `_get_connection()` 注册 UDF
+
+**位置**：实际第387行 `PRAGMA busy_timeout=5000` 之后
+
+```python
+conn.execute("PRAGMA busy_timeout=5000")
+conn.create_function('cjk_bigram', 1, _cjk_bigram)  # ← 新增
+```
+
+---
+
+### 改动 4：beam.py — FTS5 trigger（v1.2 修正）
+
+**位置**：`init_beam()` 第609-650行区域
+
+v1.2 修正：`em_ad` 的删除操作也需要 bigram。FTS5 delete 命令通过 tokenize content 定位并清理倒排索引，若 content 不经 bigram 转换，删除对应的 bigram 条目会静默失败，留下孤立条目。
+
+| Trigger | 实际行 | 改动 | DROP 处理 |
+|---------|--------|------|----------|
+| `em_ai` | 611 | `cjk_bigram(new.content)` | 需加 DROP |
+| `em_ad` | 616 | `cjk_bigram(old.content)` | 需加 DROP（v1.2 新增） |
+| `em_au` | 621 | old 和 new 均 bigram | 需加 DROP |
+| `wm_ai` | 629 | `cjk_bigram(new.content)` | 需加 DROP |
+| `wm_ad` | 634 | 不改（按 id DELETE，不涉及 content tokenization） | 不需要 |
+| `wm_au` | 644 | `cjk_bigram(new.content)` | **上游已有 DROP** |
+
+完整改动代码：
+
+```python
+cursor.execute("DROP TRIGGER IF EXISTS em_ai")
+cursor.execute("""
+    CREATE TRIGGER IF NOT EXISTS em_ai AFTER INSERT ON episodic_memory BEGIN
+        INSERT INTO fts_episodes(rowid, content) VALUES (new.rowid, cjk_bigram(new.content));
+    END
+""")
+
+cursor.execute("DROP TRIGGER IF EXISTS em_ad")
+cursor.execute("""
+    CREATE TRIGGER IF NOT EXISTS em_ad AFTER DELETE ON episodic_memory BEGIN
+        INSERT INTO fts_episodes(fts_episodes, rowid, content) VALUES ('delete', old.rowid, cjk_bigram(old.content));
+    END
+""")
+
+cursor.execute("DROP TRIGGER IF EXISTS em_au")
+cursor.execute("""
+    CREATE TRIGGER IF NOT EXISTS em_au AFTER UPDATE ON episodic_memory BEGIN
+        INSERT INTO fts_episodes(fts_episodes, rowid, content) VALUES ('delete', old.rowid, cjk_bigram(old.content));
+        INSERT INTO fts_episodes(rowid, content) VALUES (new.rowid, cjk_bigram(new.content));
+    END
+""")
+
+cursor.execute("DROP TRIGGER IF EXISTS wm_ai")
+cursor.execute("""
+    CREATE TRIGGER IF NOT EXISTS wm_ai AFTER INSERT ON working_memory BEGIN
+        INSERT INTO fts_working(id, content) VALUES (new.id, cjk_bigram(new.content));
+    END
+""")
+
+# wm_ad 不改
+
+# wm_au：上游已有 DROP，只改 INSERT 内容
+cursor.execute("""
+    CREATE TRIGGER IF NOT EXISTS wm_au AFTER UPDATE OF content ON working_memory BEGIN
+        DELETE FROM fts_working WHERE id = old.id;
+        INSERT INTO fts_working(id, content) VALUES (new.id, cjk_bigram(new.content));
+    END
+""")
+```
+
+---
+
+### 改动 5：beam.py — 查询侧 bigram 转换
+
+**位置**：`_fts_search`（第1441行后）和 `_fts_search_working`（第1478行后），各加1行
+
+```python
+safe_query = _re.sub(r'[^\w\s]', ' ', query)
+safe_query = ' '.join(safe_query.split())
+safe_query = _cjk_bigram(safe_query)        # ← 新增
+if not safe_query.strip():
+    return []
+```
+
+**已知边界**：BEAM 模式有 `len(w) > 1` 过滤，单字 CJK 查询（如 `云`）会被过滤返回空。索引侧的 unigram 条目仍保留，不影响常见中文双字词命中。
+
+---
+
+## 3. 分阶段目标
+
+| 阶段 | 目标 | 预计耗时 |
+|------|------|---------|
+| P0 | 代码实现（embeddings.py + beam.py） | 1-2 小时 |
+| P1 | 本地单测 | 30 分钟 |
+| P2 | 容器集成验证（Plugin 模式） | 1 小时 |
+| P3 | 实际使用观察（1-2周） | 持续 |
+| P4 | 提交上游 PR | 1 小时 |
+
+各阶段详细计划见对应文件：`P0_实施.md` → `P4_PR.md`
+
+---
+
+## 4. 回滚方案
+
+```bash
+# 回退 beam.py 和 embeddings.py
+git checkout main -- mnemosyne/core/beam.py mnemosyne/core/embeddings.py
+
+# 重启容器
+docker restart hermes
+```
+
+> **数据安全**：记忆数据存储在 `episodic_memory` / `working_memory` 表中，FTS 索引（`fts_episodes` / `fts_working`）是衍生索引。即使 FTS 索引损坏，原始数据不受影响。
+
+---
+
+## 5. 总结
+
+| 维度 | 结论 |
+|------|------|
+| 改动文件数 | 2 个（`embeddings.py` + `beam.py`） |
+| 总改动行数 | 约 55-65 行 |
+| 新增依赖 | 0 个 |
+| 数据风险 | 无（FTS 是衍生索引） |
+| 回滚成本 | 极低（两文件还原 + 容器重启） |
+| 部署方式 | Plugin 模式，pip install -e 到 Hermes venv |
+| 对英文内容影响 | 无（英文词直接保留） |
+| 预期中文 FTS 改善 | 0% → ~85%+ 常见中文关键词命中率 |
