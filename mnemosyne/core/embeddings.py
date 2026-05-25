@@ -36,8 +36,11 @@ _FASTEMBED_AVAILABLE = np is not None and TextEmbedding is not None
 _FASTEMBED_CACHE_DIR = os.path.join(os.path.expanduser("~/.hermes"), "cache", "fastembed")
 
 # --- OpenAI-compatible API ---
-_OPENAI_API_KEY = os.environ.get("OPENROUTER_API_KEY", os.environ.get("OPENAI_API_KEY", ""))
-_OPENAI_BASE_URL = os.environ.get("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
+_OPENAI_API_KEY = os.environ.get("DASHSCOPE_API_KEY",
+                  os.environ.get("OPENROUTER_API_KEY",
+                  os.environ.get("OPENAI_API_KEY", "")))
+_OPENAI_BASE_URL = os.environ.get("MNEMOSYNE_EMBEDDING_BASE_URL",
+                   os.environ.get("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1"))
 
 # --- Model selection ---
 _DEFAULT_MODEL = os.environ.get("MNEMOSYNE_EMBEDDING_MODEL", "BAAI/bge-small-en-v1.5")
@@ -88,6 +91,8 @@ def _get_embedding_dim(model_name: str) -> int:
         # --- Jina ---
         "jina-embeddings-v5-omni-nano": 768,
         "jina-embeddings-v5-omni-small": 1024,
+        # --- DashScope Qwen ---
+        "text-embedding-v4": 1024,
     }
     # Check env override first
     env_dim = os.environ.get("MNEMOSYNE_EMBEDDING_DIM")

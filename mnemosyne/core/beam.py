@@ -385,6 +385,7 @@ def _get_connection(db_path: Path = None) -> sqlite3.Connection:
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA busy_timeout=5000")
+        conn.create_function('cjk_bigram', 1, _cjk_bigram)
         if _SQLITE_VEC_AVAILABLE:
             try:
                 conn.enable_load_extension(True)
@@ -607,27 +608,31 @@ def init_beam(db_path: Path = None):
     """)
 
     # --- FTS5 Triggers for episodic ---
+    cursor.execute("DROP TRIGGER IF EXISTS em_ai")
     cursor.execute("""
         CREATE TRIGGER IF NOT EXISTS em_ai AFTER INSERT ON episodic_memory BEGIN
-            INSERT INTO fts_episodes(rowid, content) VALUES (new.rowid, new.content);
+            INSERT INTO fts_episodes(rowid, content) VALUES (new.rowid, cjk_bigram(new.content));
         END
     """)
+    cursor.execute("DROP TRIGGER IF EXISTS em_ad")
     cursor.execute("""
         CREATE TRIGGER IF NOT EXISTS em_ad AFTER DELETE ON episodic_memory BEGIN
-            INSERT INTO fts_episodes(fts_episodes, rowid, content) VALUES ('delete', old.rowid, old.content);
+            INSERT INTO fts_episodes(fts_episodes, rowid, content) VALUES ('delete', old.rowid, cjk_bigram(old.content));
         END
     """)
+    cursor.execute("DROP TRIGGER IF EXISTS em_au")
     cursor.execute("""
         CREATE TRIGGER IF NOT EXISTS em_au AFTER UPDATE ON episodic_memory BEGIN
-            INSERT INTO fts_episodes(fts_episodes, rowid, content) VALUES ('delete', old.rowid, old.content);
-            INSERT INTO fts_episodes(rowid, content) VALUES (new.rowid, new.content);
+            INSERT INTO fts_episodes(fts_episodes, rowid, content) VALUES ('delete', old.rowid, cjk_bigram(old.content));
+            INSERT INTO fts_episodes(rowid, content) VALUES (new.rowid, cjk_bigram(new.content));
         END
     """)
 
     # --- FTS5 Triggers for working memory ---
+    cursor.execute("DROP TRIGGER IF EXISTS wm_ai")
     cursor.execute("""
         CREATE TRIGGER IF NOT EXISTS wm_ai AFTER INSERT ON working_memory BEGIN
-            INSERT INTO fts_working(id, content) VALUES (new.id, new.content);
+            INSERT INTO fts_working(id, content) VALUES (new.id, cjk_bigram(new.content));
         END
     """)
     cursor.execute("""
@@ -645,7 +650,7 @@ def init_beam(db_path: Path = None):
     cursor.execute("""
         CREATE TRIGGER IF NOT EXISTS wm_au AFTER UPDATE OF content ON working_memory BEGIN
             DELETE FROM fts_working WHERE id = old.id;
-            INSERT INTO fts_working(id, content) VALUES (new.id, new.content);
+            INSERT INTO fts_working(id, content) VALUES (new.id, cjk_bigram(new.content));
         END
     """)
 
@@ -1432,6 +1437,25 @@ def _vec_search(conn: sqlite3.Connection, embedding: List[float], k: int = 20) -
     return [{"rowid": r["rowid"], "distance": r["distance"]} for r in rows]
 
 
+def _cjk_bigram(text: str) -> str:
+    """CJK-aware bigram tokenizer for FTS5. CJK chars -> unigram + bigram; Latin/digits kept as words."""
+    result, buf = [], ''
+    for i, c in enumerate(text):
+        if '一' <= c <= '鿿' or '㐀' <= c <= '䶿':
+            if buf:
+                result.extend(re.findall(r'[a-zA-Z0-9_]+', buf))
+                buf = ''
+            result.append(c)
+            next_c = text[i + 1] if i + 1 < len(text) else ''
+            if '一' <= next_c <= '鿿' or '㐀' <= next_c <= '䶿':
+                result.append(c + next_c)
+        else:
+            buf += c
+    if buf:
+        result.extend(re.findall(r'[a-zA-Z0-9_]+', buf))
+    return ' '.join(result) if result else text
+
+
 def _fts_search(conn: sqlite3.Connection, query: str, k: int = 20) -> List[Dict]:
     """Search FTS5 episodes and return rowids with ranks.
     Strips FTS5-special characters, keeps alphanumeric + spaces.
@@ -1439,6 +1463,7 @@ def _fts_search(conn: sqlite3.Connection, query: str, k: int = 20) -> List[Dict]
     import re as _re
     safe_query = _re.sub(r'[^\w\s]', ' ', query)
     safe_query = ' '.join(safe_query.split())  # Collapse whitespace
+    safe_query = _cjk_bigram(safe_query)
     if not safe_query.strip():
         return []
     
@@ -1476,6 +1501,7 @@ def _fts_search_working(conn: sqlite3.Connection, query: str, k: int = 20) -> Li
     import re as _re
     safe_query = _re.sub(r'[^\w\s]', ' ', query)
     safe_query = ' '.join(safe_query.split())  # Collapse whitespace
+    safe_query = _cjk_bigram(safe_query)
     if not safe_query.strip():
         return []
     
