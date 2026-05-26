@@ -54,6 +54,7 @@ htmlcov/
 # OS
 .DS_Store
 Thumbs.db
+nul
 
 # Devops plans (private — not for public repo)
 DEVOPS.md
