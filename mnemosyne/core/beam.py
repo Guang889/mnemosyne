@@ -1941,6 +1941,24 @@ class BeamMemory:
         self.conn.commit()
         self._trim_working_memory()
 
+        # --- Embedding generation for single remember() ---
+        # remember_batch() already does this; single remember() was missing it,
+        # causing memory_embeddings to stay empty and dense_score to always be 0.
+        try:
+            vector = _embeddings.embed([content])
+            if vector is not None and len(vector) == 1:
+                emb_json = _embeddings.serialize(vector[0])
+                self.conn.execute(
+                    "INSERT OR REPLACE INTO memory_embeddings (memory_id, embedding_json, model) VALUES (?, ?, ?)",
+                    (memory_id, emb_json, _embeddings._DEFAULT_MODEL),
+                )
+                self.conn.commit()
+        except Exception as exc:
+            logger.warning(
+                "remember: embedding storage failed for %s (%s): %s",
+                memory_id, type(exc).__name__, exc,
+            )
+
         # Auto-generate temporal triple
         self._add_temporal_triple(memory_id, timestamp, source, content)
 
