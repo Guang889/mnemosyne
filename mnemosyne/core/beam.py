@@ -1606,35 +1606,6 @@ def _contains_spaceless_cjk(text: str) -> bool:
     )
 
 
-def _cjk_fts_terms(text: str) -> List[str]:
-    """Generate FTS-safe terms for CJK text.
-
-    The default unicode61 tokenizer indexes each CJK character as an
-    individual token. Unquoted character terms match directly. Bigrams
-    are quoted as phrases for multi-character matching.
-    """
-    cjk_chars = [
-        ch for ch in text
-        if "\u4e00" <= ch <= "\u9fff"
-        or "\u3040" <= ch <= "\u30ff"
-        or "\uac00" <= ch <= "\ud7af"
-    ]
-    if not cjk_chars:
-        return []
-    terms: List[str] = []
-    seen: Set[str] = set()
-    for ch in cjk_chars:
-        if ch not in seen:
-            seen.add(ch)
-            terms.append(ch)  # bare unigram matches individual token
-    for i in range(len(cjk_chars) - 1):
-        bigram = cjk_chars[i] + cjk_chars[i + 1]
-        if bigram not in seen:
-            seen.add(bigram)
-            terms.append(f'"{bigram}"')  # quoted bigram phrase match
-    return terms
-
-
 def _lexical_relevance(query_tokens: List[str], content: str, query_lower: str = "") -> float:
     """Conservative lexical score in [0, 1]. Returns 0 for no real token overlap.
 
