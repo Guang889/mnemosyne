@@ -58,14 +58,15 @@ try:
     from mnemosyne.core.episodic_graph import EpisodicGraph, GraphEdge
 except ImportError:
     EpisodicGraph = None
+    GraphEdge = None
 
 import re as _re
 
 # ---------------------------------------------------------------------------
 # CJK bigram tokenizer
 # ---------------------------------------------------------------------------
-# The default unicode61 FTS5 tokenizer does not index CJK characters on the
-# SQLite build shipped in most Linux/Docker environments.  We register a
+# The default unicode61 FTS5 tokenizer keeps contiguous CJK text as a token,
+# preventing substring word matches inside that run.  We register a
 # pure-Python UDF so that Chinese text is indexed as unigrams AND bigrams,
 # enabling both single-character and two-character (word-level) FTS5 MATCH.
 #
@@ -116,7 +117,64 @@ def _cjk_bigram(text: str) -> str:
 def _register_cjk_bigram(conn: sqlite3.Connection) -> None:
     """Register cjk_bigram UDF on *conn* (idempotent — SQLite replaces on re-register)."""
     conn.create_function('cjk_bigram', 1, _cjk_bigram, deterministic=True)
-    GraphEdge = None
+
+
+def _migrate_cjk_fts(conn: sqlite3.Connection) -> None:
+    """Atomically upgrade both FTS indexes and their writers, once per version.
+
+    External-content FTS must be rebuilt explicitly with tokenized source text;
+    FTS5's native rebuild would index raw content. A savepoint preserves an
+    enclosing transaction and rolls back DDL, postings and marker on failure.
+    All writers must be stopped before upgrading a database from an old runtime.
+    """
+    conn.execute("SAVEPOINT cjk_fts_upgrade")
+    try:
+        conn.execute("CREATE TABLE IF NOT EXISTS cjk_fts_schema (version INTEGER PRIMARY KEY)")
+        version = conn.execute("SELECT MAX(version) FROM cjk_fts_schema").fetchone()[0]
+        if version is not None and version != 1:
+            raise RuntimeError(f"Unsupported CJK FTS schema version: {version}")
+        if version is None:
+            for name in ("em_ai", "em_ad", "em_au", "wm_ai", "wm_ad", "wm_au"):
+                conn.execute(f"DROP TRIGGER IF EXISTS {name}")
+            for sql in (
+                """CREATE TRIGGER em_ai AFTER INSERT ON episodic_memory BEGIN
+                    INSERT INTO fts_episodes(rowid, content) VALUES (new.rowid, cjk_bigram(new.content));
+                END""",
+                """CREATE TRIGGER em_ad AFTER DELETE ON episodic_memory BEGIN
+                    INSERT INTO fts_episodes(fts_episodes, rowid, content)
+                    VALUES ('delete', old.rowid, cjk_bigram(old.content));
+                END""",
+                """CREATE TRIGGER em_au AFTER UPDATE OF content ON episodic_memory
+                WHEN old.content IS NOT new.content BEGIN
+                    INSERT INTO fts_episodes(fts_episodes, rowid, content)
+                    VALUES ('delete', old.rowid, cjk_bigram(old.content));
+                    INSERT INTO fts_episodes(rowid, content) VALUES (new.rowid, cjk_bigram(new.content));
+                END""",
+                """CREATE TRIGGER wm_ai AFTER INSERT ON working_memory BEGIN
+                    INSERT INTO fts_working(id, content) VALUES (new.id, cjk_bigram(new.content));
+                END""",
+                """CREATE TRIGGER wm_ad AFTER DELETE ON working_memory BEGIN
+                    DELETE FROM fts_working WHERE id = old.id;
+                END""",
+                """CREATE TRIGGER wm_au AFTER UPDATE OF content ON working_memory
+                WHEN old.content IS NOT new.content BEGIN
+                    DELETE FROM fts_working WHERE id = old.id;
+                    INSERT INTO fts_working(id, content) VALUES (new.id, cjk_bigram(new.content));
+                END""",
+            ):
+                conn.execute(sql)
+            conn.execute("INSERT INTO fts_episodes(fts_episodes) VALUES ('delete-all')")
+            conn.execute("INSERT INTO fts_episodes(rowid, content) SELECT rowid, cjk_bigram(content) FROM episodic_memory")
+            conn.execute("DELETE FROM fts_working")
+            conn.execute("INSERT INTO fts_working(id, content) SELECT id, cjk_bigram(content) FROM working_memory")
+            conn.execute("INSERT INTO cjk_fts_schema(version) VALUES (1)")
+        conn.execute("RELEASE SAVEPOINT cjk_fts_upgrade")
+    except BaseException:
+        conn.execute("ROLLBACK TO SAVEPOINT cjk_fts_upgrade")
+        conn.execute("RELEASE SAVEPOINT cjk_fts_upgrade")
+        raise
+
+
 try:
     from mnemosyne.core.veracity_consolidation import (
         VeracityConsolidator,
@@ -901,53 +959,8 @@ def init_beam(db_path: Path = None):
         )
     """)
 
-    # --- FTS5 Triggers for episodic ---
-    cursor.execute("""
-        CREATE TRIGGER IF NOT EXISTS em_ai AFTER INSERT ON episodic_memory BEGIN
-            INSERT INTO fts_episodes(rowid, content) VALUES (new.rowid, cjk_bigram(new.content));
-        END
-    """)
-    # em_ad and em_au must reference the *indexed* form (cjk_bigram) for the
-    # FTS5 external-content delete protocol to locate the right postings.
-    cursor.execute("DROP TRIGGER IF EXISTS em_ad")
-    cursor.execute("""
-        CREATE TRIGGER IF NOT EXISTS em_ad AFTER DELETE ON episodic_memory BEGIN
-            INSERT INTO fts_episodes(fts_episodes, rowid, content) VALUES ('delete', old.rowid, cjk_bigram(old.content));
-        END
-    """)
-    cursor.execute("DROP TRIGGER IF EXISTS em_au")
-    cursor.execute("""
-        CREATE TRIGGER IF NOT EXISTS em_au AFTER UPDATE ON episodic_memory BEGIN
-            INSERT INTO fts_episodes(fts_episodes, rowid, content) VALUES ('delete', old.rowid, cjk_bigram(old.content));
-            INSERT INTO fts_episodes(rowid, content) VALUES (new.rowid, cjk_bigram(new.content));
-        END
-    """)
-
-    # --- FTS5 Triggers for working memory ---
-    cursor.execute("DROP TRIGGER IF EXISTS wm_ai")
-    cursor.execute("""
-        CREATE TRIGGER IF NOT EXISTS wm_ai AFTER INSERT ON working_memory BEGIN
-            INSERT INTO fts_working(id, content) VALUES (new.id, cjk_bigram(new.content));
-        END
-    """)
-    cursor.execute("""
-        CREATE TRIGGER IF NOT EXISTS wm_ad AFTER DELETE ON working_memory BEGIN
-            DELETE FROM fts_working WHERE id = old.id;
-        END
-    """)
-    # The wm_au trigger restricts to UPDATE OF content so sleep's
-    # consolidated_at marker writes don't churn the FTS index. Pre-E3
-    # this trigger fired on every UPDATE -- fine when UPDATEs were rare;
-    # post-E3 sleep marks SLEEP_BATCH_SIZE rows per cycle and would
-    # otherwise generate 2*N FTS round-trips per sleep with no content
-    # delta. SQLite column-list triggers handle the perf concern.
-    cursor.execute("DROP TRIGGER IF EXISTS wm_au")
-    cursor.execute("""
-        CREATE TRIGGER IF NOT EXISTS wm_au AFTER UPDATE OF content ON working_memory BEGIN
-            DELETE FROM fts_working WHERE id = old.id;
-            INSERT INTO fts_working(id, content) VALUES (new.id, cjk_bigram(new.content));
-        END
-    """)
+    # Upgrade trigger definitions and historical postings as one atomic unit.
+    _migrate_cjk_fts(conn)
 
     # --- MEMORIA: Structured Fact Tables (Phase 1) ---
     cursor.execute("""

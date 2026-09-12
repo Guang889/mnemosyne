@@ -1,0 +1,6 @@
+# Direct runtime dependencies; resolved against the currently deployed Python 3.13 environment.
+# Keep the resulting hashed requirements.lock with the startup script.
+PyYAML==6.0.3
+sqlite-vec==0.1.9
+fastembed==0.8.0
+numpy==2.5.3
