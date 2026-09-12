@@ -58,6 +58,64 @@ try:
     from mnemosyne.core.episodic_graph import EpisodicGraph, GraphEdge
 except ImportError:
     EpisodicGraph = None
+
+import re as _re
+
+# ---------------------------------------------------------------------------
+# CJK bigram tokenizer
+# ---------------------------------------------------------------------------
+# The default unicode61 FTS5 tokenizer does not index CJK characters on the
+# SQLite build shipped in most Linux/Docker environments.  We register a
+# pure-Python UDF so that Chinese text is indexed as unigrams AND bigrams,
+# enabling both single-character and two-character (word-level) FTS5 MATCH.
+#
+# Rules:
+#   • CJK Unified Ideographs (U+4E00-U+9FFF) and Extension A (U+3400-U+4DBF)
+#     are emitted as unigram then, if the next character is also CJK, as a
+#     bigram pair.  This covers the vast majority of Simplified/Traditional
+#     Chinese without requiring any external dependency.
+#   • Non-CJK runs are kept as-is using word-boundary splitting so that Latin,
+#     digits, and other scripts are not altered (Cyrillic, accented Latin, etc.
+#     are preserved by the catch-all buf flush).
+#   • If the text contains no CJK characters the original text is returned
+#     unchanged, making the function a no-op for pure-ASCII/Latin content.
+# ---------------------------------------------------------------------------
+
+def _cjk_bigram(text: str) -> str:
+    """CJK-aware bigram tokenizer for FTS5.
+
+    Returns a space-separated token string for use as FTS5 index content.
+    Non-CJK runs are split on whitespace/punctuation boundaries; CJK
+    characters emit unigrams and consecutive-CJK bigrams.
+    """
+    if not isinstance(text, str):
+        return text
+    result: list[str] = []
+    buf = ''
+    for i, c in enumerate(text):
+        if '\u4e00' <= c <= '\u9fff' or '\u3400' <= c <= '\u4dbf':
+            if buf:
+                # Flush non-CJK buffer preserving all non-whitespace runs
+                for tok in _re.split(r'\s+', buf):
+                    if tok:
+                        result.append(tok)
+                buf = ''
+            result.append(c)                          # unigram
+            nxt = text[i + 1] if i + 1 < len(text) else ''
+            if '\u4e00' <= nxt <= '\u9fff' or '\u3400' <= nxt <= '\u4dbf':
+                result.append(c + nxt)                # bigram
+        else:
+            buf += c
+    if buf:
+        for tok in _re.split(r'\s+', buf):
+            if tok:
+                result.append(tok)
+    return ' '.join(result) if result else text
+
+
+def _register_cjk_bigram(conn: sqlite3.Connection) -> None:
+    """Register cjk_bigram UDF on *conn* (idempotent — SQLite replaces on re-register)."""
+    conn.create_function('cjk_bigram', 1, _cjk_bigram, deterministic=True)
     GraphEdge = None
 try:
     from mnemosyne.core.veracity_consolidation import (
@@ -491,6 +549,7 @@ def _get_connection(db_path: Path = None) -> sqlite3.Connection:
                 )
         else:
             conn._mnemosyne_vec_loaded = False
+        _register_cjk_bigram(conn)
         _thread_local.conn = conn
         _thread_local.db_path = str(path)
     return _thread_local.conn
@@ -845,25 +904,30 @@ def init_beam(db_path: Path = None):
     # --- FTS5 Triggers for episodic ---
     cursor.execute("""
         CREATE TRIGGER IF NOT EXISTS em_ai AFTER INSERT ON episodic_memory BEGIN
-            INSERT INTO fts_episodes(rowid, content) VALUES (new.rowid, new.content);
+            INSERT INTO fts_episodes(rowid, content) VALUES (new.rowid, cjk_bigram(new.content));
         END
     """)
+    # em_ad and em_au must reference the *indexed* form (cjk_bigram) for the
+    # FTS5 external-content delete protocol to locate the right postings.
+    cursor.execute("DROP TRIGGER IF EXISTS em_ad")
     cursor.execute("""
         CREATE TRIGGER IF NOT EXISTS em_ad AFTER DELETE ON episodic_memory BEGIN
-            INSERT INTO fts_episodes(fts_episodes, rowid, content) VALUES ('delete', old.rowid, old.content);
+            INSERT INTO fts_episodes(fts_episodes, rowid, content) VALUES ('delete', old.rowid, cjk_bigram(old.content));
         END
     """)
+    cursor.execute("DROP TRIGGER IF EXISTS em_au")
     cursor.execute("""
         CREATE TRIGGER IF NOT EXISTS em_au AFTER UPDATE ON episodic_memory BEGIN
-            INSERT INTO fts_episodes(fts_episodes, rowid, content) VALUES ('delete', old.rowid, old.content);
-            INSERT INTO fts_episodes(rowid, content) VALUES (new.rowid, new.content);
+            INSERT INTO fts_episodes(fts_episodes, rowid, content) VALUES ('delete', old.rowid, cjk_bigram(old.content));
+            INSERT INTO fts_episodes(rowid, content) VALUES (new.rowid, cjk_bigram(new.content));
         END
     """)
 
     # --- FTS5 Triggers for working memory ---
+    cursor.execute("DROP TRIGGER IF EXISTS wm_ai")
     cursor.execute("""
         CREATE TRIGGER IF NOT EXISTS wm_ai AFTER INSERT ON working_memory BEGIN
-            INSERT INTO fts_working(id, content) VALUES (new.id, new.content);
+            INSERT INTO fts_working(id, content) VALUES (new.id, cjk_bigram(new.content));
         END
     """)
     cursor.execute("""
@@ -881,7 +945,7 @@ def init_beam(db_path: Path = None):
     cursor.execute("""
         CREATE TRIGGER IF NOT EXISTS wm_au AFTER UPDATE OF content ON working_memory BEGIN
             DELETE FROM fts_working WHERE id = old.id;
-            INSERT INTO fts_working(id, content) VALUES (new.id, new.content);
+            INSERT INTO fts_working(id, content) VALUES (new.id, cjk_bigram(new.content));
         END
     """)
 
@@ -1261,6 +1325,9 @@ class _BeamConnection(sqlite3.Connection):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        # Register CJK bigram UDF on every connection created via factory=
+        # (covers worker-thread connections that bypass _get_connection).
+        _register_cjk_bigram(self)
         self._defer_commit = False
 
     def commit(self) -> None:
@@ -2549,7 +2616,23 @@ def _vec_search(conn: sqlite3.Connection, embedding: List[float], k: int = 20) -
 
 
 def _fts_query_terms(query: str) -> List[str]:
-    """FTS-safe meaningful terms for natural-language recall queries."""
+    """FTS-safe meaningful terms for natural-language recall queries.
+
+    When the query contains CJK characters the index holds bigram tokens
+    (written by the cjk_bigram UDF trigger).  We therefore tokenize the
+    query through the same function and build an OR-match across all
+    resulting tokens so that both unigrams and bigrams are searched.
+    Non-CJK queries follow the existing expansion path unchanged.
+    """
+    if _has_cjk(query):
+        # Produce the same token stream that was written into the index.
+        tokens = _cjk_bigram(query).split()
+        terms = []
+        for tok in tokens:
+            tok = tok.replace('"', '""').strip()
+            if tok:
+                terms.append(f'"{tok}"')
+        return terms
     terms = []
     for term in _expanded_query_tokens(_recall_tokens(query)):
         term = term.replace('"', '""').strip()
