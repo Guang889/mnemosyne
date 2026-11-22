@@ -43,3 +43,9 @@ provides_hooks:
   - on_session_start
   - post_tool_call
 dependencies: []
+# Direct runtime pins from deploy/hermes/requirements.in and mnemosyne-deps.lock.
+# NumPy follows Hermes core and FastEmbed's compatible constraints in PM.
+python_dependencies:
+  - PyYAML==6.0.3
+  - "sqlite-vec==0.1.9; sys_platform == 'linux' or sys_platform == 'darwin' or sys_platform == 'win32'"
+  - "fastembed==0.8.0; sys_platform == 'linux' or sys_platform == 'darwin' or sys_platform == 'win32'"
